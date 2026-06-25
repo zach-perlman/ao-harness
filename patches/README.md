@@ -21,5 +21,5 @@ would re-expose the upstream API keys) and the large generated eval-dataset JSON
 ### Apply on a fresh checkout
 ```bash
 cd activation_oracles/third_party/cot-oracle   # at commit bec6f8a
-git apply /path/to/ao-harness/patches/cot-oracle-local.patch
+git apply /path/to/repo/patches/cot-oracle-local.patch
 ```

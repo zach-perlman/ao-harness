@@ -47,18 +47,22 @@ Qwen3.6-35B-A3B-FP8 on :8001.
   past entries or retroactively redefine what "success" was.
 
 ## Portability (how to carry this to a new Vast box)
-`/workspace` is wiped on recycle, so the work lives in two GitHub repos:
-- **`zach-perlman/ao-harness`** — THIS dir (config.yaml, ao_cli, Makefile, AGENTS.md,
-  docs/, scripts/, patches/). Remote `origin`.
-- **`zach-perlman/activation_oracles`** — code-only snapshot of the fork (remote `zach`;
-  `origin` still points at upstream `japhba`). Large datasets + the cot-oracle submodule
-  contents are NOT included; the cot-oracle functional edits are saved here as
-  `patches/cot-oracle-local.patch`.
+`/workspace` is wiped on recycle, so the whole project lives in ONE GitHub repo:
+**`zach-perlman/activation_oracles`** (remote `origin`). It contains both the harness
+(this dir: config.yaml, ao_cli, Makefile, AGENTS.md, docs/, scripts/, patches/) AND the
+forked research code under `activation_oracles/` as plain files (its nested `.git` was
+removed when folding it in). One `git clone` restores everything.
 
-On a fresh box: clone both repos, rebuild envs (`scripts/setup_envs.sh`), re-pull the
-cot-oracle submodule (`ceselder/cot-oracle@bec6f8a`) and `git apply` the patch, then
-regenerate data. Commit with `git -c user.name=… -c user.email=…` (repo identity is not
-set globally). User Rules are account-level and sync via Cursor login.
+NOT in the repo (regenerable / vendored / heavy, so re-fetch or regenerate on a fresh box):
+- `activation_oracles/third_party/cot-oracle` — the cot-oracle submodule
+  (`ceselder/cot-oracle@bec6f8a`). Re-clone it, then `git apply` our
+  `patches/cot-oracle-local.patch` to restore the functional edits.
+- `activation_oracles/{tex,wandb}`, all data blobs >2MB, and the regenerable corpora.
 
-NOTE: the fork repo is a squashed snapshot (the local clone was shallow, so upstream
-history couldn't be pushed). Full history remains at `japhba/activation_oracles`.
+On a fresh box: `git clone` the repo, rebuild envs (`scripts/setup_envs.sh`), re-pull the
+cot-oracle submodule + apply the patch, then regenerate data. Commit with
+`git -c user.name=… -c user.email=…` (repo identity is not set globally). User Rules are
+account-level and sync via Cursor login.
+
+NOTE: this is a squashed/code-only snapshot — the fork's upstream history was not carried
+over. Full history remains at `japhba/activation_oracles`.
