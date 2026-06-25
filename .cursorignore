@@ -1,0 +1,7 @@
+envs/
+.hf_home/
+logs/
+unsloth_compiled_cache/
+**/site-packages/**
+**/*.jsonl
+*.log

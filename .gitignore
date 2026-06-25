@@ -1,0 +1,22 @@
+# Heavy / regenerable (never commit)
+envs/
+artifacts/
+.hf_home/
+logs/
+unsloth_compiled_cache/
+
+# The activation_oracles fork is its OWN git repo, pushed separately
+activation_oracles/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Data blobs & logs
+*.jsonl
+*.log
+*.out
+
+# Local env / secrets
+.env

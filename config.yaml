@@ -1,0 +1,675 @@
+# =============================================================================
+# Activation Oracle project — central config (Phase 1: Qwen3.5-4B)
+#
+# Everything model-, data-, training-, and eval-related is configured HERE.
+# The Makefile targets read this file via `python -m ao_cli ...` and render it
+# into the vendored repo's JSON training configs / CLI invocations, so you
+# never edit JSON by hand.
+#
+# Paper reference values ("Building Better Activation Oracles") are noted in
+# comments next to each knob.
+# =============================================================================
+
+model:
+  # Main target model = AO base model (they share weights; the AO is a LoRA).
+  # ACTIVE: Qwen/Qwen3.5-4B — the codebase's NATIVE target (the gemma-4-12B run was a
+  # detour that scored near-chance on AObench across two recipes; see the v1/v2 evals).
+  # Qwen3.5-4B is a dense 32-layer model in the Qwen3.5 "small" series: strong for its
+  # size (GPQA-Diamond 76.2, MMMU-Pro 66.3) yet only ~8GB in bf16, so it trains AND
+  # evals with huge headroom beside the FP8 judge on one H200.
+  #
+  # ARCHITECTURE: hybrid Gated DeltaNet (linear-attention, recurrent, no KV) + a few
+  # full Gated-Attention layers, natively multimodal. Why this is low-risk HERE:
+  #   - vLLM 0.23 ships a native `qwen3_5` model -> the corpus stage works out of the box.
+  #   - sft.py routes Qwen3.5 through Unsloth's FastLanguageModel (text-decoder path),
+  #     so training.use_unsloth=true uses the already-built envs/unsloth unchanged.
+  #   - The AO reads/injects the RESIDUAL stream, which is continuous across BOTH layer
+  #     types, so center_percent depth-selection + the norm-matched injection hook are
+  #     architecture-agnostic. The Qwen3.5-0.8B smoke exercises this SAME DeltaNet
+  #     residual path end-to-end before we commit the real run.
+  #
+  # COST CAVEAT: Qwen3.5-4B is VERBOSE (~8k-token CoTs), so `make corpus` is the long
+  # pole of data gen. It's a small fast model under vLLM (high concurrency on the H200),
+  # but gate it with a 1-problem vLLM probe before the full 40k-problem sweep.
+  # ALTERNATIVES (dispatched by model name):
+  #   - Qwen/Qwen3-8B: the paper's native model; reuse RELEASED data with ZERO gen
+  #     (set data.use_released_datasets=true). The cheap pipeline-sanity option.
+  #   - google/gemma-4-12B-it: prior target; near-chance on AObench here (v1 + v2).
+  # Switching models forces a full local regen (corpus -> convqa -> evalsets -> SFT).
+  name: Qwen/Qwen3.5-4B
+  # Tiny model for `make smoke` (corpus -> convqa -> evalsets -> train -> eval in
+  # minutes). Qwen3.5-0.8B is the smallest dense Qwen3.5 and shares the 4B's Gated
+  # DeltaNet hybrid arch, so smoke validates the REAL activation-collection + injection
+  # path (not just the chat/thinking format) before the multi-hour 4B gen.
+  smoke_name: Qwen/Qwen3.5-0.8B
+
+layers:
+  # Which target-model layers' residual activations are fed to the AO.
+  # Paper: performance peaks ~62-65% depth; 5 contiguous layers help further
+  # (Qwen3-8B: layers 21-25 of 36). We resolve center_percent against the
+  # model's actual num_hidden_layers at render time.
+  center_percent: 64
+  n_layers: 5
+
+injection:
+  # Activations are injected additively + norm-matched into the AO residual
+  # stream after this layer: resid <- resid + normalize(v)*||resid||*coef
+  # (sft.py get_hf_activation_steering_hook). hook_onto_layer=1 = after the 2nd
+  # transformer block, matching Adam's formula the paper keeps.
+  hook_onto_layer: 1
+  # TRAIN-time injection strength, baked into the AO by the training hook
+  # (sft.py uses the SAME norm-matched get_hf_activation_steering_hook as eval).
+  # The paper trains every released config at 1.0; keep it here for the fresh
+  # Qwen3.5-4B run (paper default). (The 2.0 value was a gemma-4-E4B-only
+  # experiment to overcome THAT model's frozen "No" prior; it unfroze the margins
+  # but didn't fix the E-series missing_info inversion and hurt other tasks. The
+  # 12B is a clean dense decoder, so we start from the proven 1.0 baseline.)
+  steering_coefficient: 1.0
+  # EVAL-time injection strength. The paper's recipe is: train at 1.0, then SWEEP
+  # injection strength at INFERENCE, recommending ~2.0x as a better default
+  # (marginal overall, but hallucination 79% -> 85%). That's exactly "what they
+  # did" for the 2x. ao_cli/evaluate.py exports this as AO_EVAL_STEERING_COEFFICIENT,
+  # which every AObench eval reads into its VerbalizerEvalConfig.steering_coefficient.
+  # Set 1.0 to reproduce the paper's headline table numbers; 2.0 = their rec.
+  eval_steering_coefficient: 2
+
+judge:
+  # Local LLM judge served by vLLM with an OpenAI-compatible API. Replaces
+  # Anthropic everywhere (AObench judging + convqa generation).
+  #
+  # We serve Qwen3.6-35B-A3B — a Mixture-of-Experts model (35B total, but only
+  # 3B ACTIVE per token). Versus the dense 27B it is ~2.3x faster at prefill and
+  # ~3.7x at decode on the same GPU; convqa is prefill-heavy, so the full data
+  # pass drops from ~8-12h to ~3-5h while carrying MORE total capacity.
+  #
+  # Quant = FP8 (37.5GB), not bf16: the bf16 checkpoint is 71.9GB. On this H200
+  # (Hopper, sm_90, ~140GB) bf16 would now fit, but FP8 is still the better pick:
+  # Hopper has NATIVE FP8 tensor cores, so vLLM runs the matmuls in true FP8
+  # (no bf16 dequant — unlike the old Ampere A100, which lacked FP8 and had to
+  # weight-only dequantize). FP8 is near-lossless for an MoE, halves weight
+  # bandwidth, and leaves ~100GB for KV/Mamba cache and concurrency.
+  #
+  # On the 140GB card the judge and a target-model generator coexist directly in
+  # FP8 during evalsets (no separate Int4 build needed anymore); see
+  # ao_cli/evalsets.py.
+  model: Qwen/Qwen3.6-35B-A3B-FP8
+  served_name: local-judge
+  port: 8001
+  gpu_memory_utilization: 0.45   # ~63GB of 140GB: 37.5GB weights + ~25GB KV/Mamba/graphs.
+                                 #   During EVAL the judge and the AO model share one GPU (eval
+                                 #   needs the judge for scoring, so it can't be stopped like
+                                 #   training does). The AO eval's activation-collection forward
+                                 #   on long-CoT tasks (backtracking, causal_faithfulness) peaks
+                                 #   ~50-60GB; 0.65 left only ~8GB free and OOM'd. 0.45 leaves
+                                 #   ~77GB for the AO model. The judge only trickles scoring calls
+                                 #   at eval time, so the smaller KV cache costs nothing here —
+                                 #   raise back toward 0.65 ONLY for a fresh high-concurrency
+                                 #   convqa data pass (data.convqa.max_concurrent).
+  max_model_len: 32768
+  # Qwen3.5-35B-A3B is mostly GatedDeltaNet (recurrent, no KV) + a few full-
+  # attention layers, so KV is cheap; the real limit is one Mamba state block per
+  # concurrent decode sequence. The ~53GB cache on H200 supports far more state
+  # blocks than the A100's ~14GB did, so we lift concurrency 64 -> 256 to push the
+  # prefill-heavy convqa pass harder. Matches data.convqa.max_concurrent.
+  max_num_seqs: 256
+  # Thinking OFF: the convqa rounds are structured extraction (pick a split,
+  # answer from a given span), not open reasoning. Thinking would ~3-5x latency
+  # across ~70k calls and risks truncating answers under the token cap, for
+  # little quality gain. (Toggle true only if you also raise convqa max_tokens.)
+  enable_thinking: false
+
+data:
+  # When true (and NOT smoke), training pulls the paper's RELEASED Qwen3-8B
+  # datasets straight from the Hub instead of the locally generated on-policy
+  # files — convqa from the v2 template's hf_dataset_repo
+  # (cds-jb/cot-oracle-convqa-chunked-haiku) and the past/future-lens corpus from
+  # ceselder/cot-oracle-corpus-v5. This trains Qwen3-8B with ZERO data
+  # generation. render.py honors this flag; set false to use the locally
+  # generated artifacts/<slug>/ corpus + convqa (the local-target path).
+  # FALSE because model.name is Qwen/Qwen3.5-4B — the released convqa + corpus repos
+  # are Qwen3-8B-keyed and would mismatch this target's activations, so we regenerate
+  # everything locally (corpus -> convqa -> evalsets) from Qwen3.5-4B.
+  # Set true ONLY when model.name is Qwen/Qwen3-8B (the paper's native target).
+  use_released_datasets: false
+  # ---- Stage 1: on-policy CoT corpus (rollouts from model.name) ----
+  # Used as (a) the past/future-lens corpus and (b) the source of convqa.
+  # (Skipped when use_released_datasets=true.)
+  corpus:
+    n_problems: 40_000
+    n_rollouts: 1
+  # ---- Stage 2: conversational QA ("questions about unarticulated
+  # completions", the paper's main uplift) generated by the local judge ----
+  convqa:
+    n_rows: 30_000              # paper's chunked convqa had ~27K rows
+    test_frac: 0.02
+    max_concurrent: 256        # parallel judge requests (matches judge.max_num_seqs)
+  # ---- Stage 3: training mixture sizes (rendered into the train config) ----
+  mix:
+    # These set each source's pool size, which (after shuffle, consumed until the
+    # 10M-token budget) fixes the training MIXTURE PROPORTIONS. Match the paper
+    # template exactly: convqa is ~56% of the pool (the main-uplift task) vs the
+    # classification (~22K) + past_lens (40K) remainder. 60000 silently dropped
+    # convqa to ~49%, under-weighting the most important data — restored to 79872.
+    convqa_n: 99000            # sampled with replacement; paper template: 79872
+    past_lens_n: 40000         # paper template: 40000
+    # Released convqa source(s), one entry each (only used when
+    # use_released_datasets=true). We use the SONNET set: it's the higher-quality
+    # conversational data the post credits for the main uplift (Sonnet 4.6 writes
+    # more SPECIFIC, less text-invertible questions → less vague AO), and it's
+    # ~3.8x larger (99,563 vs 26,180 rows), so convqa_n draws are nearly all unique
+    # instead of heavily resampling haiku's 26k. Only `question_category` is absent
+    # vs haiku, which the training loader never reads (uses cot_prefix/prompt/
+    # target_response). Alternatives on the Hub: ...-chunked-haiku (cheaper, vaguer;
+    # what the v2 template hard-codes) and cds-jb/...-chunked-gemini.
+    convqa_repos:
+      - ceselder/cot-oracle-convqa-chunked-sonnet
+  # ---- AObench eval datasets to regenerate for model.name ----
+  # Each needs target-model rollouts (vLLM); backtracking/missing_info also
+  # use the judge. vagueness + domain_confusion derive from backtracking.
+  evalsets:
+    # Regenerated for model.name (Qwen3.5-4B) by `make evalsets`/`make data`, which
+    # OVERWRITES the installed AObench/datasets/<task>/ (currently still gemma-keyed
+    # from the prior run). backtracking IS included so the full paper_seven_plus
+    # profile is native to this target: vagueness + domain_confusion DERIVE from
+    # backtracking, and missing_info yields the activation_sensitivity pairs — so
+    # these four cover paper_seven (causal_faithfulness ships built-in pairs;
+    # model_diffing self-skips). Without backtracking those three tasks would score
+    # on STALE gemma data. Drop it again only to skip its judge+rollout gen cost.
+    tasks: [number_prediction, mmlu_prediction, missing_info, backtracking]
+    # Target items/task for the regenerated evalsets, passed to each generator as
+    # --n-per-task. Bumped 200->300 to de-noise the AUC-sensitive tasks (last run:
+    # number 50, mmlu 100) — ~300 puts AUC/rate SE near 0.03 (vs ~0.08 at n=50).
+    #   - number_prediction: scales all 5 difficulty buckets proportionally -> ~300.
+    #   - mmlu_prediction: balanced, so 150 correct + 150 incorrect = 300.
+    #   - missing_info: NO-OP. Its size is fixed by the hand-written PROBLEMS list
+    #     (39 problems -> up to ~234 entries / ~78 A-vs-C activation_sensitivity
+    #     pairs); this flag can't grow it — add entries to PROBLEMS in
+    #     data_pipelines/missing_info/generate_dataset.py to de-noise that task.
+    # NOTE: this is a REGENERATION target — it only takes effect after
+    # `make evalsets` (vLLM rollouts + judge, hours), which REPLACES the baked
+    # original Qwen3-8B datasets, so re-run BOTH `make eval` and
+    # `make eval-baseline` on the new sets to keep the comparison apples-to-apples.
+    n_per_task: 300
+
+training:
+  # lr carried over CONSERVATIVELY from the gemma-12B runs (paper peak is 3e-4, but
+  # gemma-12B diverged the instant LR reached 3e-4/1e-4). Qwen3.5-4B has no divergence
+  # history here, so 5e-5 is the safe FIRST-run choice; effective LR = lr * rsLoRA's
+  # alpha/sqrt(r) = 5e-5 * 1.41. If the first run trains cleanly and under-fits, raise
+  # toward the paper's 3e-4 for faster convergence.
+  lr: 5.0e-5
+  # Anti-overfit recipe carried from gemma-v2 (it lowered held-out loss vs the paper's
+  # r=128/dropout=0, which overfit before becoming competent). Portable to Qwen3.5-4B:
+  #   lora_r 64        : moderate adapter capacity (the main memorization lever).
+  #   lora_alpha 11    : holds rsLoRA effective scale alpha/sqrt(r) ~= 1.4 at r=64
+  #                      (11/sqrt(64) = 16/sqrt(128) = 1.4), so capacity moves WITHOUT
+  #                      also shifting the effective LR.
+  #   lora_dropout 0.05: light regularization that flattens the overfit tail.
+  # Revert to r=128/alpha=16 for max capacity if Qwen3.5-4B under-fits at r=64.
+  lora_r: 64
+  lora_alpha: 11
+  use_rslora: true
+  lora_dropout: 0.05
+  # Stability knobs (the 3e-4 + rsLoRA run diverged mid-warmup; these harden it):
+  #   max_grad_norm — global L2 grad-norm clip applied to the accumulated gradient
+  #     before each optimizer step. 0.5 (was 1.0) clamps spikes harder so a single
+  #     bad batch can't kick the LoRA weights off the manifold.
+  #   warmup_ratio  — fraction of optimizer steps spent ramping LR 0->peak. 0.15
+  #     (was 0.10) ramps gentler so the model adapts before LR reaches its peak.
+  max_grad_norm: 0.5
+  warmup_ratio: 0.15
+  # MICRO-batch: examples per forward/backward, which drives activation VRAM. The
+  # EFFECTIVE optimizer batch is batch_size * gradient_accumulation_steps. Qwen3.5-4B
+  # (~8GB bf16, 32 layers) is small, so the un-checkpointed graph fits the H200 with
+  # huge headroom: we run the full effective batch of 16 in ONE forward (no
+  # accumulation), halving forward passes per step vs the 12B's batch-8 x accum-2 — a
+  # straight speed win on the smaller model. Bump to 32 only if you also keep the
+  # effective batch tied to the LR you tuned.
+  batch_size: 16
+  # effective_batch = batch_size * this = 16 * 1 = 16 (the W recipe's batch).
+  gradient_accumulation_steps: 1
+  # Unsloth (fused Triton kernels + optimized LoRA + fused cross-entropy that
+  # avoids the full-vocab fp32-logits OOM) speeds up the SFT. Data generation is
+  # unaffected — it runs in envs/vllm + the judge, not here.
+  # TRUE for Qwen3.5-4B: sft.py treats Qwen3.5 as a pure text decoder and loads it via
+  # Unsloth's FastLanguageModel (the gemma-4 multimodal FastModel branch is NOT taken),
+  # so this uses the already-built envs/unsloth (transformers>=5) unchanged. Unsloth's
+  # fused Triton kernels + fused cross-entropy give 2-5x speed and avoid the full-vocab
+  # fp32-logits OOM. Routes SFT through envs/unsloth.
+  use_unsloth: true
+  # FP8 LoRA (Unsloth + TorchAO): frozen base in FP8, adapters in bf16. ~1.3-1.4x
+  # faster + ~40-60% less base-model VRAM on the H200, accuracy ~= bf16 for LoRA.
+  # Only takes effect when use_unsloth=true. Left OFF until a bf16 Unsloth run is
+  # verified, then flip on for the extra speed/VRAM headroom.
+  fp8: false
+  # Gradient checkpointing trades ~20-30% throughput for memory. OFF: we control the
+  # 12B's activation VRAM with the micro-batch + gradient accumulation above instead
+  # (batch 8 fits with headroom), which avoids GC's recompute tax entirely. Flip on
+  # only if even batch 8 OOMs (e.g. a much longer max sequence) — with
+  # use_unsloth=true it maps to Unsloth's offloaded "unsloth" checkpointing and the
+  # in-place steering hooks stay correct via the use_reentrant=True enable in sft.py.
+  gradient_checkpointing: false
+  num_epochs: 1
+  # The winner `W_5layer_320k` (+0.360) and our single-haiku pool BOTH only assemble
+  # ~220k examples, so its "320k" cap never binds — training is one epoch over the
+  # full pool (~10M loss tokens at ~45 tok/ex). Both knobs below are therefore
+  # NON-binding for the single-repo recipe; they're kept generous so the example
+  # COUNT (one full epoch) is the stop, exactly matching W (which used no token cap).
+  max_target_tokens: 30000000
+  max_train_examples: 320000   # non-binding (single-repo pool ~220k); = one epoch
+  # Periodic recovery-snapshot cadence in OPTIMIZER STEPS (one full epoch ~= 14.9k steps
+  # at effective batch 16) -> save_dir/step_<n>. These are now just a SAFETY NET: the
+  # adapter eval actually loads is save_dir/best, the running validation-loss MINIMUM
+  # snapshotted every validation_steps (=500, from the template) by sft.py's
+  # best-checkpoint tracker. 1000 -> ~15 recovery snapshots without bloating disk.
+  save_steps: 1000
+  seed: 42
+  wandb_mode: online         # set to "online" + wandb login to track runs
+  wandb_project: ao-qwen3.5
+
+eval:
+  # AObench profile (see third_party/cot-oracle/AObench/README.md):
+  #   paper_six   = number_prediction, mmlu_prediction, backtracking,
+  #                 vagueness, domain_confusion, missing_info
+  #   paper_seven = paper_six + activation_sensitivity ("Not Just Reading
+  #                 Tokens": same tokens, different upstream context -> the AO
+  #                 should answer differently. The cleanest inversion-resistance
+  #                 metric, and our headline number for C1/C3/C4). Already shipped
+  #                 in AObench; we just promote it into the default profile.
+  #   paper_seven_plus = paper_seven + the two contribution evals:
+  #                 model_diffing (C5) and causal_faithfulness (C6). Both SELF-SKIP
+  #                 when their assets are absent (no variant family / no CFE data),
+  #                 so this is safe on every checkpoint: CFE runs everywhere
+  #                 (ships built-in minimal pairs), model_diffing only adds a column
+  #                 on runs that built variants. After enabling, re-run
+  #                 `make eval-baseline` so the frozen baseline gets the new columns.
+  # `include` (non-empty) overrides the profile with an explicit task list.
+  profile: paper_seven_plus
+  include: []
+  n_positions: 50
+  # Which aobench_results/ run dir the dashboard treats as the comparison
+  # baseline (the "reference" curve), and how to label it. Set to our frozen
+  # replication; `make eval-baseline` writes here, and `make eval` reads it back
+  # for the ours-vs-baseline dashboard. Leave baseline_run empty to fall back to
+  # auto-detecting the alphabetically-first `baseline*` dir.
+  baseline_run: baseline_replication
+  baseline_label: "Replication (ours)"
+  # Size of the in-training MCQ validation probe (the [mcq:cot_*_test] line in
+  # the training log). It is a DIAGNOSTIC only — validation-only, never affects
+  # weights — reporting mean sigmoid(logp_with_acts - logp_without_acts) over
+  # this many held-out convqa rows. The template default (25) is noisy
+  # (SE ~ std/sqrt(n) ~ 0.06), so the curve jitters +-0.1 between checkpoints;
+  # ~200 cuts SE to ~0.02 for a readable trend at negligible cost (the probe
+  # runs every validation_steps, 2 forward passes per row, vectors cached).
+  mcq_n: 200
+
+contributions:
+  # =============================================================================
+  # Six targeted improvements over the replication baseline, each runnable in
+  # ISOLATION and auto-compared to `baseline_replication` (see eval.baseline_run).
+  #
+  # MECHANISM. Set EXP=<name> on the make line to give a run its own named
+  # checkpoint (artifacts/<slug>/checkpoints/<EXP>/final) and eval dir
+  # (aobench_results/<EXP>); render.py appends a dataset_configs entry for every
+  # contribution whose `enabled: true` here, so the toggles below decide what is
+  # actually mixed in. All-off reproduces the baseline. Turn ON exactly one at a
+  # time to attribute its effect cleanly:
+  #   make train EXP=c3_logitlens   (with logit_lens.enabled=true)
+  #   make eval  EXP=c3_logitlens   -> dashboard c3_logitlens vs Replication (ours)
+  # The `n` knobs are pool sizes (examples materialized), the same lever the
+  # base mixture uses (data.mix); they set the mixture PROPORTION after the
+  # 10M-token budget trims the shuffled pool.
+  # =============================================================================
+
+  # C3 — logit-lens prediction (self-supervised SFT task). Target = the target
+  # model's own top-k next-token prediction at ~65% depth, read off the
+  # activation via the unembedding (final norm + lm_head). No text shortcut.
+  #
+  # RECIPE NOTE (after the first c3_logitlens run): free_form at 30k taught the AO
+  # to HEDGE ("no number here") — it shifted global output style and tanked
+  # number_prediction (has_number 0.98->0.69). Two changes fix that:
+  #   • task_format: binary  — Yes/No probes inject the same activation-reading
+  #     pressure WITHOUT polluting free-form output style; also the doc's own
+  #     sanity check (Option-B AUC>0.65) and AObench's recommended yes/no metric.
+  #   • n: 12000 (~8% of pool, was 30k/~18%) — a smaller dose, less collateral.
+  # (Was briefly ENABLED as a gemma-4-E4B experiment to add yes/no-binary
+  # supervision against that model's frozen "No" prior; it unfroze the margins but
+  # did not fix gemma's missing_info inversion and regressed number_prediction, so
+  # it is OFF for the Qwen3-8B replication, which reproduces the paper recipe.)
+  logit_lens:
+    enabled: false
+    n: 12000               # ~8% of the ~220k pool (was 30000 ≈ 18%)
+    top_k: 5               # number of logit-lens tokens the AO must name
+    task_format: binary    # binary (is 'X' top-k?) | free_form (list top-k)
+    # lens = how the top-k next-token target is read off the layer-l activation:
+    #   logit  : raw logit lens — unembed(final_norm(resid)). Zero-shot but
+    #            BRITTLE at mid-depth (representational drift, high-frequency-token
+    #            bias; Belrose et al. 2023), so a chunk of targets are noise.
+    #   tuned  : tuned lens — first apply a per-layer affine translator that maps
+    #            resid into the final-layer basis (fit once to match the model's
+    #            OWN final next-token distribution via KL), THEN unembed. Far more
+    #            calibrated mid-network -> cleaner targets. Translator is tiny
+    #            (one d×d affine), fit on a short corpus pass and cached on disk.
+    lens: tuned            # tuned | logit
+    tuned_lens_tokens: 500000   # corpus tokens used to fit the translator (once, cached)
+    tuned_lens_steps: 400       # optimizer steps for the translator fit
+    tuned_lens_lr: 1.0e-3       # AdamW lr for the (identity-initialized) translator
+
+  # C5 — contrastive model-diffing (SFT task). Inject the (finetuned - base)
+  # activation difference; target = the known finetune description. Requires
+  # `make diffing` first (builds the LoRA variant family under
+  # artifacts/<slug>/diffing_variants/).
+  model_diffing:
+    enabled: false
+    n: 30000               # ~15% of the pool
+    inject_mode: both      # both | delta | variant  (delta=diff, variant=raw a_v)
+    n_prompts: 2000        # shared prompts run through base + each variant
+
+  # ---------------------------------------------------------------------------
+  # Synthetic corpus-activation tasks (C9, C12, C13). Each is a self-supervised
+  # SFT task that reads the target model's residual on the SAME corpus C3/C5 use,
+  # then TRANSFORMS the activation (combine / group / corrupt) so the label is
+  # known by construction — verifiable, no judge, and (unlike past/future lens)
+  # no surrounding text to invert. Materialized during `make gen`/`make train`;
+  # no separate build step. Toggle each independently and run under its own EXP.
+  # ---------------------------------------------------------------------------
+
+  # C9 — activation arithmetic. Inject a SYNTHETIC vector a1±a2 built from two
+  # corpus activations; target = the two source tokens. The combined vector maps
+  # to no real text, so it can't be text-inverted — success needs reading the
+  # residual stream's (near-linear) feature structure directly.
+  #   Precise: sample anchors (xi@pi, xj@pj); inject v = a^L(xi,pi) ± a^L(xj,pj),
+  #   one vector per layer of combo L; supervise "decode(xi[pi]), decode(xj[pj])".
+  #   e.g. a("…to the park") + a("…a dog ran") -> target "park, dog".
+  activation_arithmetic:
+    enabled: false
+    n: 20000               # ~10% of the pool
+    mode: both             # both | sum (a1+a2) | diff (a1-a2)
+
+  # C12 — odd-one-out. Inject k activations (k-1 from one passage, 1 intruder
+  # from another); target = the intruder's slot. The only task that makes the AO
+  # COMPARE multiple injected activations (relational reading), a diversity axis
+  # the paper's pointwise mixture lacks.
+  #   Precise: draw k-1 anchors from doc A + 1 from doc B, shuffle into slots 1..k,
+  #   inject all k (vectors ordered layer-major, slot-minor); supervise the
+  #   1-indexed slot holding the doc-B activation. Chance = 1/k.
+  odd_one_out:
+    enabled: false
+    n: 20000               # ~10% of the pool
+    k_activations: 4       # injection slots per example (>=3); exactly one intruder
+
+  # C13 — denoising robustness. Inject a corpus activation corrupted with Gaussian
+  # noise (scaled per-layer to the activation's own norm); target = the CLEAN
+  # anchor token. Trains the AO to read off-manifold/noisy vectors (SAE features,
+  # steering vectors, cross-model diffs are all noisy) instead of overfitting to
+  # pristine activations.
+  #   Precise: a = a^L(x,p); inject ã_l = a_l + ε_l, ε_l ~ N(0, (noise_scale·||a_l||)^2)
+  #   independently per layer l; supervise decode(x[p]). Reconstruction-under-corruption.
+  denoising:
+    enabled: false
+    n: 20000               # ~10% of the pool
+    noise_scale: 0.3       # noise std as a fraction of each layer's activation norm
+
+  # C8 — injection-strength & depth curriculum. Self-supervised corpus task that
+  # injects an activation from a RANDOM layer (percent_choices) at a RANDOM scale
+  # (U[scale_min, scale_max]); target = the clean anchor token. Trains the AO to
+  # read activations outside the single fixed-depth/strength regime the paper uses.
+  #   Precise: pick layer l~Uniform(percent_choices→abs idx), scale s~U[scale_min,scale_max];
+  #   inject s·a^{l}(x,p) at that SINGLE layer; supervise decode(x[p]). Objective =
+  #   decode invariance to (depth l, magnitude s).
+  injection_curriculum:
+    enabled: false
+    n: 20000               # ~10% of the pool
+    percent_choices: [25, 40, 55, 70, 85]  # candidate single-layer depths (% of model depth)
+    scale_min: 0.5         # injected vector is multiplied by U[scale_min, scale_max]
+    scale_max: 2.0
+
+  # C10 — graded-intensity probing. Reuses the C5 style-variant DIRECTIONS
+  # (mean a_v - a_0): inject a_0 + alpha*direction at a known alpha; target = the
+  # intensity bucket. Teaches a calibrated "how strongly present" readout.
+  # Requires `make diffing` (style family) first.
+  #   Precise: per variant v, d_v,l = mean_p(a_v(p) - a_0(p)) for layer l (a_v = act with
+  #   variant adapter on, a_0 = base off); inject a_0(p) + alpha·d_v across L; supervise
+  #   labels[i] where alpha = alphas[i]. alpha=0 -> "none" (must NOT over-report).
+  graded_intensity:
+    enabled: false
+    n: 20000               # ~10% of the pool
+    n_prompts: 400         # corpus prompts used to fit directions AND host injections
+    alphas:  [0.0, 0.5, 1.0, 2.0]              # injection intensities (parallel to labels)
+    labels:  ["none", "weak", "moderate", "strong"]
+
+  # C7 — latent knowledge recovery. The AO recovers a fabricated FACT a variant was
+  # finetuned to believe, from the variant's raw activation on neutral prompts.
+  # Requires `make diffing FAMILIES=fact` (judge-synthesized fact variants).
+  #   Precise: variant M_v LoRA-finetuned to assert fact f; inject a_{M_v}^L(x) at the LAST
+  #   token of a NEUTRAL prompt x (x never mentions f); supervise the canonical statement of f.
+  #   Tests reading HELD knowledge, not echoing prompt text. (inject_mode = variant)
+  knowledge_recovery:
+    enabled: false
+    n: 16000               # ~8% of the pool
+    n_prompts: 2000        # neutral seeds/prompts run through each fact variant
+    on_policy: true        # read acts off the variant's OWN continuation of a neutral seed
+                           #   (the fact surfaces in its rollout) vs raw corpus text. The
+                           #   "Building Better AOs" on-policy lever; costs 1 short gen/seed.
+    gen_max_new_tokens: 64 # tokens the variant generates per seed (on_policy only)
+    gen_temperature: 0.8   # sampling temp for the on-policy rollouts
+
+  # C11 — secret elicitation (Taboo). The AO recovers the SECRET WORD a variant was
+  # finetuned to hint at but never say, from its activations on neutral prompts.
+  # Requires `make diffing FAMILIES=secret` (judge-synthesized secret variants).
+  #   Precise: variant M_v finetuned to allude to secret word w while never emitting w; inject
+  #   a_{M_v}^L(x) at the last token of a neutral prompt x; supervise w. Concealed-information
+  #   elicitation straight from activations (the held-out word never appears in x). (inject_mode = variant)
+  secret_elicitation:
+    enabled: false
+    n: 16000               # ~8% of the pool
+    n_prompts: 2000        # neutral seeds/prompts run through each secret variant
+    on_policy: true        # read acts off the variant's OWN continuation of a neutral seed
+                           #   (it hints at the secret in its rollout) vs raw corpus text.
+                           #   The "Building Better AOs" on-policy lever; 1 short gen/seed.
+    gen_max_new_tokens: 64 # tokens the variant generates per seed (on_policy only)
+    gen_temperature: 0.8   # sampling temp for the on-policy rollouts
+
+  # C4 — empirical solvability filter (convqa post-processing, no extra task).
+  # Keeps a convqa pair only if an early AO checkpoint answers it MEASURABLY
+  # better WITH the real activation than with a zero-injected one. When enabled,
+  # render.py points the convqa entry at the filtered parquet produced by
+  # `make convqa-solvability EXP=...` (see ao_cli/convqa.py --solvability-filter).
+  solvability_filter:
+    enabled: false
+    delta: 0.1             # min (real - zero) cosine gain to keep a pair. NOTE: this is an
+                           #   absolute cosine *difference*, whose scale is embedder-specific and
+                           #   can't be mapped from a static text set. If you re-enable this with
+                           #   embeddinggemma, RE-TUNE from the "mean activation gain" the
+                           #   solvability run prints (gemma's compressed cosine range likely makes
+                           #   0.10 too strict — start lower, e.g. ~0.03–0.05, and tune up).
+    lora: artifacts/Qwen3.5-4B/checkpoints/replication_v1   # the scorer (not untrained); repointed off gemma-4-E4B
+    embed_model: google/embeddinggemma-300m   # migrated from mpnet (see rl.embed_model); via SentenceEmbedder
+
+  # C1/C2 — RL post-training (Phase 2; needs the GRPO trainer, nl_probes/grpo).
+  # These are NOT part of `make train`; they run via `make rl EXP=...` starting
+  # from an SFT checkpoint (rl.init_lora). Kept here so their knobs live with the
+  # rest of the recipe.
+  swap_test:               # C1 (anti-inversion): OFFLINE DPO. Mine the same token in
+    enabled: false         #   two contexts, prefer each context's own AO answer over
+                           #   the other's. Sharpens context-sensitivity, no online
+                           #   reward to game (see nl_probes/preference/injection_dpo).
+    beta: 0.05              # DPO temperature (implicit KL strength to the SFT reference)
+                           #   (sweepable via AO_DPO_BETA without editing config)
+    n_tokens: 1800          # distinct content tokens to mine context pairs from
+                           #   (raised 1200→1800 for more token diversity / tighter CI)
+    pairs_per_token: 4     # context pairs sampled per token (raised 3→4)
+    distinct_threshold: 0.30  # keep a pair only if cosine-DISTANCE(ansA, ansB) >= this
+                              #   (identical answers carry no chosen↔rejected signal).
+                              #   Retuned 0.25→0.30 for embeddinggemma (rl.embed_model): on a
+                              #   labeled same/different AO-answer set gemma puts paraphrases at
+                              #   distance ~0.26 and genuinely-different readings above ~0.31, so
+                              #   0.30 cleanly drops paraphrase pairs. (mpnet was near-blind here:
+                              #   SAME/DIFF cosine means differed by only 0.003 vs gemma's 0.061.)
+    gen_temperature: 0.0   # AO answer generation for pair construction (0 = greedy)
+    epochs: 2              # passes over the mined pairs (sweepable via AO_DPO_EPOCHS;
+                           #   the beta sweep uses 1 to rank faster, final model uses 2)
+    batch_size: 32          # pairs per optimizer step. train_dpo now micro-batches the
+                           #   step's 2·batch_size sequences into ONE forward, so this
+                           #   genuinely scales VRAM + speed (raise lr if you raise it).
+                           #   (sweepable via AO_DPO_BATCH)
+    lr: 5.0e-6
+  abstention:              # C2 (calibrated abstention): hardened GRPO with a verifiable
+    enabled: false         #   TERNARY reward (answerable→answer correctly, unanswerable
+                           #   →abstain), per-sample so the group mean is a clean baseline.
+    k_samples: 16          # rollouts sampled per prompt (the GRPO group). Bumped 8→16:
+                           #   the group's correct-fraction IS the knowledge-boundary
+                           #   estimate (TIAR's p̂), so more rollouts = sharper signal.
+                           #   Free VRAM-wise — C2 doesn't load the vLLM judge.
+    answerable_ratio: 0.4  # P(answerable) per scenario (FLOAT prob, not a count-ratio). 0.4 ⇒
+                           #   unanswerable-heavy. c2v1 (at 0.5) REGRESSED abstention vs the SFT
+                           #   baseline (recall 0.43→0.36): the policy over-answers, so we skew
+                           #   sampling toward unanswerable to concentrate GRPO's signal on the
+                           #   failing axis (recall). Precision is pinned at 1.0, so there is full
+                           #   headroom to chase recall without risking over-abstention.
+    correct_threshold: 0.56   # cosine(answer, gold) >= this ⇒ correct (answerable). Retuned
+                              #   for embeddinggemma-300m (see rl.embed_model): its measured
+                              #   correctness optimum on a hand-labeled AO set was ~0.56.
+    abstain_threshold: 0.58   # cosine(answer, abstain-prototype) >= this ⇒ abstaining. Retuned
+                              #   to embeddinggemma's measured abstention optimum (~0.58).
+    reward_wrong: -1.0        # confident-but-wrong (hallucination) — punished hardest
+    reward_abstain_when_answerable: -0.5  # over-abstention penalty (< |reward_wrong|)
+    tiar_lambda: 1.0          # TIAR strength: add λ(1−2p̂) to abstaining rollouts' advantages,
+                              #   p̂=correct-frac among attempts (difficulty). 0 disables; 1.0 is
+                              #   the paper default (arXiv:2605.25850). Free (no extra fwd pass).
+    near_mismatch: true       # unanswerable question drawn from a topically-NEAR row
+                              #   (so it can't be solved as cheap out-of-distribution detection)
+    warmstart_steps: 150      # cold-start fix: short injected-SFT seeding of abstention
+                              #   mass BEFORE GRPO (0 disables). Without it a never-
+                              #   abstaining policy gives zero-variance unanswerable groups.
+    warmstart_answerable_ratio: 0.55  # P(answerable) for the warm-start seed ONLY (FLOAT prob),
+                              #   decoupled from GRPO's answerable_ratio. The abstain target is one
+                              #   fixed string (an easy attractor): too abstention-heavy and the seed
+                              #   SATURATES to "always-abstain", which is ALSO a zero-variance trap
+                              #   (answerable groups then all get −0.5 → dropped → no gradient to
+                              #   re-learn answering). We keep it near the boundary (slightly
+                              #   answer-leaning) so the post-warm-start policy is genuinely UNCERTAIN
+                              #   on unanswerable (~50% abstain) — the high-entropy state GRPO needs.
+    warmstart_lr: 1.0e-5      # ABSOLUTE warm-start SFT lr, decoupled from rl.lr (which GRPO uses).
+                              #   This recipe (≈1e-5) produced the healthy balanced seed; pin it so
+                              #   raising rl.lr for GRPO doesn't also overheat the warm-start.
+
+calibration:
+  # Inference-time uncertainty quantification — ADOPTED, NOT TRAINED (doc Section 3).
+  #   • Yes/No logit margin: a cheap per-query triage signal, already computed by
+  #     AObench's binary probes (margin_yes_minus_no) and surfaced in the dashboard
+  #     ROC/threshold panels — nothing to add here.
+  #   • Bootstrap mode frequency: the best-calibrated UQ for AOs (Torrielli 2026,
+  #     ECE 5.7% vs 25.5% for log-prob). `make calibration EXP=<run>` MEASURES it:
+  #     sample k completions on an answerable factual probe, semantically cluster
+  #     them, take the modal cluster's frequency as the confidence, and report ECE
+  #     vs. correctness so each AO run gets a comparable calibration number.
+  # We deliberately do NOT train/prompt verbal confidence (anti-calibrated; Miao &
+  # Ungar 2026), so this lives only in the eval tooling.
+  k_samples: 8                  # completions sampled per probe (mode-frequency = consensus)
+  temperature: 0.8              # sampling temperature for the k draws (>0 to get a distribution)
+  cluster_threshold: 0.70       # cosine >= this groups two completions into one cluster. Kept at
+                                #   0.70 under embeddinggemma: its measured same/different answer
+                                #   boundary (c*≈0.69) already coincides with this value.
+  correct_threshold: 0.56       # cosine(modal answer, ground-truth concept) >= this ⇒ correct.
+                                #   Retuned 0.55→0.56 to match gemma's correctness optimum (same
+                                #   metric + embedder as the C2 abstention reward's correct_threshold).
+  n_probes: 120                 # answerable factual items drawn from data_pipelines/factual
+  embed_model: google/embeddinggemma-300m   # migrated from mpnet (see rl.embed_model); via SentenceEmbedder
+
+rl:
+  # Shared Phase-2 settings. C1 uses DPO (its own beta/lr in contributions.swap_test);
+  # C2 uses the GRPO trainer with the hardened defaults below.
+  init_lora: artifacts/Qwen3.5-4B/checkpoints/replication_v1  # SFT start point (Stage 1); repointed off gemma-4-E4B
+  k_completions: 4         # (legacy) — C2 group size is contributions.abstention.k_samples
+  batch_scenarios: 6       # scenarios sampled per optimizer step (× k = rollouts/step).
+                           #   Bumped 4→6: at 1:1 sampling the answerable/abstain gradients partly
+                           #   cancel, so cleaner (less noisy) per-step gradients matter. Only the
+                           #   GENERATION KV-cache scales with this (× oversample × k sequences held
+                           #   at once); the batched scoring stays chunk-bounded. Kept at 6 (not 8)
+                           #   to stay within VRAM headroom (training sits ~100/140 GB; 8 risks OOM).
+  lr: 4.0e-6               # Bumped 1e-6→4e-6: at 1e-6 the held-out reward was FLAT for 100 steps
+                           #   (policy frozen at the warm-start). The re-anchored KL + balanced
+                           #   sampling guard against the earlier collapse modes, so a larger step
+                           #   is safe and needed to actually move within the pilot budget.
+  max_steps: 300           # PILOT: short benefit-check run (~2 h). Paired with eval_every=50 and
+                           #   the trainer's step-0 baseline, this is the MINIMUM config to tell
+                           #   whether GRPO moves the held-out abstention reward above the
+                           #   untrained policy. Raise back to ~1500 for a full run once confirmed.
+  # --- hardened GRPO knobs (C2) ---
+  kl_coef: 0.005           # KL anchor to the (re-anchored) post-warm-start reference. Lowered
+                           #   0.02→0.005 after 250 steps stayed FLAT with kl pinned ≈4e-4: the
+                           #   equilibrium displacement from the reference ∝ 1/kl_coef and is
+                           #   independent of lr (which is why the 1e-6→4e-6 bump didn't move it),
+                           #   so kl_coef — not lr — is the lever. 0.005 keeps a light leash (the
+                           #   collapse failure modes return without ANY anchor) while letting the
+                           #   reward gradient actually reshape the policy.
+  inner_epochs: 1          # μ: updates reusing each rollout batch (PPO-clipping only bites if >1)
+  dynamic_sampling: true   # DAPO: drop zero-variance groups (no learning signal)
+  rollout_temperature: 1.1 # sampling temp for the k rollouts/scenario (was hard-coded 0.9). Raised
+                           #   to widen within-group abstain/answer SPREAD: an over-answering policy
+                           #   at low temp emits all-answer groups → zero variance → dynamic_sampling
+                           #   drops them → ~no gradient (the c2v1 failure). More entropy ⇒ more
+                           #   surviving mixed-outcome groups ⇒ a cleaner, larger advantage signal.
+  eval_every: 50           # steps between held-out reward evals. PILOT: 50 (was 200) gives a
+                           #   baseline@0 + 6 trend points over 300 steps, so a benefit (or its
+                           #   absence) is visible early. Held-out eval = 64 greedy gens (chunked,
+                           #   memory-bounded); 64 (was 32) gives finer resolution so sub-threshold
+                           #   shifts in abstention rate register instead of quantizing to 1/19.
+  max_target_tokens: 8000000   # ~5-10M-token RL budget
+  embed_model: google/embeddinggemma-300m   # verifiable-reward scorer (C2) + C1 pair-distinctness.
+                                             #   Swapped from all-mpnet-base-v2: on a hand-labeled AO
+                                             #   set it had the best avg ROC-AUC (corr 0.97 / abst 0.99
+                                             #   vs mpnet 0.91 / 0.83). Loaded via sentence-transformers
+                                             #   (SentenceEmbedder) so pooling/prompts are correct.
+
+hf:
+  # /workspace is NOT a persistent volume on this instance: push artifacts to
+  # the Hub so they survive a recycle. Requires HF_TOKEN (write) in
+  # /workspace/.env. With push=false everything stays under artifacts/.
+  push: false
+  namespace: "zachperlman20"                # your HF username/org, e.g. "myname"
+
+baseline:
+  # The fixed reference every new AO is measured against, evaluated by
+  # `make eval-baseline` into aobench_results/<baseline_run>/.
+  #
+  # This is now OUR OWN FROZEN REPLICATION of the paper's recommended recipe
+  # (21-25 layers, r128/a16/rsLoRA, Sonnet convqa) — the artifacts/<model>/
+  # checkpoints/replication_v1 copy of the main run we promoted on 2026-06-15.
+  # Because it is OUR checkpoint (not a legacy-locked release), eval-baseline
+  # auto-runs it in the TRAIN env (a local path triggers PY_TRAIN), so the
+  # baseline and every future `make eval` main share an identical eval stack —
+  # the comparison is exactly apples-to-apples. Its 21-25 layers come from the
+  # checkpoint's own ao_config.json, so no layer flag is needed.
+  #
+  # To re-establish the baseline on changed eval datasets/settings, just re-run
+  # `make eval-baseline` (re-evaluates this checkpoint into <baseline_run>).
+  # The paper's released AOs remain available for one-off comparisons by pointing
+  # ao_lora at an HF id (e.g. ceselder/cot-oracle-qwen3-8b-final-sprint-
+  # checkpoint-no-DPO, the recommended no-DPO ckpt — note it uses the OLD 9/18/27
+  # layers + r64/a128, so it is NOT recipe-matched to ours); an HF id auto-runs
+  # in the legacy env. NB: /workspace is ephemeral (workspace_is_volume=false) —
+  # push replication_v1 to the Hub (set HF_TOKEN + hf.namespace) so it survives a
+  # recycle, then ao_lora can point at that repo instead of the local path.
+  # model is the BASE the ao_lora adapter mounts on — it MUST match the model the
+  # checkpoint was trained on (now Qwen3.5-4B), or AObench mounts the adapter
+  # on the wrong backbone (dim mismatch) and writes the baseline under the wrong
+  # artifacts/<slug>/ dir, so the dashboard can't find it.
+  # Points at the FIRST full Qwen3.5-4B replication run — created by `make train
+  # EXP=replication_v1` after the from-scratch corpus->convqa->evalsets gen. It
+  # does NOT exist yet, so `make eval-baseline` only works once that run lands;
+  # the from-scratch contributions can still eval against it afterwards.
+  model: Qwen/Qwen3.5-4B
+  ao_lora: artifacts/Qwen3.5-4B/checkpoints/replication_v1
+
+smoke:
+  # Tiny end-to-end run (model.smoke_name): sizes only, everything else
+  # inherits from the sections above.
+  corpus_n_problems: 60
+  convqa_n_rows: 80
+  mix_convqa_n: 300
+  mix_past_lens_n: 200
+  max_target_tokens: 120000
+  eval_tasks: [number_prediction]
+  evalset_n: 12
