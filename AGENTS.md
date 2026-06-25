@@ -28,9 +28,18 @@ Qwen3.6-35B-A3B-FP8 on :8001.
   If a file or metric is referenced, open it first.
 - **/workspace is EPHEMERAL** (not a host volume): checkpoints/artifacts do NOT survive a
   recycle/destroy. Push anything irreplaceable to HF (`hf.push` + `hf.namespace`) or sync
-  off-box. This repo is also not under git — see "Portability" below.
+  off-box. The repo itself is on GitHub — see "Portability" below.
 - Prefer scoped reads; delegate broad codebase exploration to an `explore` subagent so the
   main context stays lean (cheaper, and keeps the working set focused).
+
+## Communication (output tokens are the expensive ones — keep them cheap)
+- **Default to terse.** Lead with the answer/result, then only the minimal justification.
+  Skip preamble, recaps, and restating my request. Prefer tables/bullets over prose.
+- Expand only when I ask, or to surface a non-obvious trade-off, risk, or confound.
+- **Don't compress the reasoning that prevents errors.** Be brief on status / summaries /
+  routine edits; keep the verification (falsify-first, causality checks) as long as needed.
+- Curated reading list (links, not always-on context) lives in `docs/REFERENCES.md` — open
+  a specific entry on demand only when a task calls for it; never paste it into context.
 
 ## Research discipline (this is a safety/interp project — rigor beats speed)
 - **Validate on a hard-to-fake number, not interpretability vibes.** "Steering raised
