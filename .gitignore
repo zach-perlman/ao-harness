@@ -5,8 +5,14 @@ artifacts/
 logs/
 unsloth_compiled_cache/
 
-# The activation_oracles fork is its OWN git repo, pushed separately
-activation_oracles/
+# The fork's code now lives in THIS repo (single-repo layout). Keep its code,
+# exclude the heavy / vendored parts:
+#   - third_party/cot-oracle: 1.4G submodule with secrets; functional edits in patches/
+#   - tex: paper submodule;  wandb: 226M of run logs
+# (activation_oracles/.gitignore additionally drops regenerable data + model dirs.)
+activation_oracles/third_party/
+activation_oracles/tex/
+activation_oracles/wandb/
 
 # Python caches
 __pycache__/
