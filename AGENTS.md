@@ -46,9 +46,19 @@ Qwen3.6-35B-A3B-FP8 on :8001.
   pre-committed success metric → outcome, **including nulls**). Append only: never rewrite
   past entries or retroactively redefine what "success" was.
 
-## Portability (how to carry agent config to a new Vast box)
-This dir is not a git repo and `/workspace` is wiped on recycle. To transfer: either
-`git init` + push to a remote, or include `AGENTS.md`, `.cursorignore`, `.cursor/`, and
-`docs/` in your off-box sync (HF / rclone / syncthing). On a fresh instance, restoring
-those files re-establishes all project-level agent behavior. (User Rules are account-level
-and sync automatically via Cursor login.)
+## Portability (how to carry this to a new Vast box)
+`/workspace` is wiped on recycle, so the work lives in two GitHub repos:
+- **`zach-perlman/ao-harness`** — THIS dir (config.yaml, ao_cli, Makefile, AGENTS.md,
+  docs/, scripts/, patches/). Remote `origin`.
+- **`zach-perlman/activation_oracles`** — code-only snapshot of the fork (remote `zach`;
+  `origin` still points at upstream `japhba`). Large datasets + the cot-oracle submodule
+  contents are NOT included; the cot-oracle functional edits are saved here as
+  `patches/cot-oracle-local.patch`.
+
+On a fresh box: clone both repos, rebuild envs (`scripts/setup_envs.sh`), re-pull the
+cot-oracle submodule (`ceselder/cot-oracle@bec6f8a`) and `git apply` the patch, then
+regenerate data. Commit with `git -c user.name=… -c user.email=…` (repo identity is not
+set globally). User Rules are account-level and sync via Cursor login.
+
+NOTE: the fork repo is a squashed snapshot (the local clone was shallow, so upstream
+history couldn't be pushed). Full history remains at `japhba/activation_oracles`.
