@@ -7,14 +7,23 @@ Honest, append-only record of every real training/eval run. Rules:
 - Log the **pre-committed success metric** before reading results, then the **outcome —
   including nulls / regressions**. Nulls are data; they save the next run.
 - Keep judge-scored numbers labeled as such (weaker evidence than AUC/rate metrics).
+- **Log the repro-critical fields below.** 2026 audits (ReproEvalCard, REPROBE) find the
+  most-often-missing items are randomness controls, inference engine+version, the per-task
+  **token cap**, cost, and a **failure breakdown** — and an omitted token cap silently
+  changes trajectories (exactly the Qwen3.5-4B truncation that cost us a regen). Logging
+  them makes that class of bug visible at a glance.
 
 Format per run:
 ```
-## <date> — <model> / <EXP>
-- Recipe: <key hyperparams / what changed vs prior>
-- Committed metric: <the number that would mean "this worked", set BEFORE eval>
-- Outcome: <result, incl. nulls>
-- Decision: <what we did next & why>
+## <date> — <model@revision> / <EXP>   ·   run_id <id>
+- Recipe:    <key hyperparams / what changed vs prior>
+- Inference: <engine+ver, e.g. vLLM 0.x> · max_tokens + stop rule · temp + seed · judge <model@ver>
+- Data:      <eval/dataset version or artifacts path + regen date>
+- Committed metric: <number that means "this worked", set BEFORE eval>
+- Outcome:   <result incl. nulls/regressions; label judge-scored vs AUC/rate>
+- Failures:  <counts per category, not prose — e.g. 12 truncated · 3 OOM · 0 judge-timeout>
+- Cost:      <GPU-hrs / $ / tokens — rough is fine>
+- Decision:  <what we did next & why>
 ```
 
 ---
