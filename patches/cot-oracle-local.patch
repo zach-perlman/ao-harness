@@ -1,0 +1,893 @@
+diff --git a/AObench/base_experiment.py b/AObench/base_experiment.py
+index 6ed05b9..1ae3f82 100644
+--- a/AObench/base_experiment.py
++++ b/AObench/base_experiment.py
+@@ -20,6 +20,22 @@ from AObench.utils.eval import run_binary_evaluation, run_evaluation
+ from AObench.configs.sft_config import SelfInterpTrainingConfig, read_training_config
+ 
+ 
++def _eval_generation_kwargs() -> dict[str, Any]:
++    """Decoding settings for the AO's verbalizer generation, env-overridable.
++
++    AO_EVAL_TEMPERATURE lets ao_cli sweep decoding strategy without editing code
++    (mirrors AO_EVAL_STEERING_COEFFICIENT). <=0 selects greedy/deterministic
++    decoding (drops temperature/top_p so transformers doesn't warn); otherwise we
++    sample at the given temperature. Unset = the paper's default (0.7)."""
++    t = os.environ.get("AO_EVAL_TEMPERATURE")
++    if t is None:
++        return {"do_sample": True, "temperature": 0.7, "max_new_tokens": 40, "top_p": 0.9}
++    t = float(t)
++    if t <= 0:
++        return {"do_sample": False, "max_new_tokens": 40}
++    return {"do_sample": True, "temperature": t, "max_new_tokens": 40, "top_p": 0.9}
++
++
+ # ========================================
+ # CONFIGURATION - edit here
+ # ========================================
+@@ -43,16 +59,18 @@ class VerbalizerEvalConfig:
+ 
+     activation_input_types: list[str] = field(default_factory=lambda: ["orig", "lora", "diff"])
+ 
+-    verbalizer_generation_kwargs: dict[str, Any] = field(
+-        default_factory=lambda: {
+-            "do_sample": True,
+-            "temperature": 0.7,
+-            "max_new_tokens": 40,
+-            "top_p": 0.9,
+-        }
++    verbalizer_generation_kwargs: dict[str, Any] = field(default_factory=_eval_generation_kwargs)
++
++    # Inference-time injection strength. The paper TRAINS at 1.0 (every released
++    # config) and its headline tables are at 1.0, but its steering-strength sweep
++    # found ~2.0x a better EVAL default (notably hallucination 79->85%). Both the
++    # generation and binary(AUC) eval paths use config.steering_coefficient, so
++    # this one field controls all of them; read from env so ao_cli/evaluate.py
++    # (<- config.yaml injection.eval_steering_coefficient) sets it without editing
++    # per-eval code. Defaults to 1.0 when the env var is unset.
++    steering_coefficient: float = field(
++        default_factory=lambda: float(os.environ.get("AO_EVAL_STEERING_COEFFICIENT", "1.0"))
+     )
+-
+-    steering_coefficient: float = 1.0
+     eval_batch_size: int = 256
+     special_token: str = " ?"
+     prefix_template: str = "Layer: {layer}\n{special_token} * {num_positions} \n"
+diff --git a/AObench/open_ended_eval/eval_runner.py b/AObench/open_ended_eval/eval_runner.py
+index 4995695..4d01c3a 100644
+--- a/AObench/open_ended_eval/eval_runner.py
++++ b/AObench/open_ended_eval/eval_runner.py
+@@ -63,9 +63,18 @@ RAW_ONLY_JUDGE_EVAL_PREFIXES = (
+ 
+ 
+ def ensure_default_adapter(model: AutoModelForCausalLM) -> None:
+-    """Ensure model has a 'default' adapter (needed for adapter switching)."""
++    """Ensure model has a 'default' adapter (needed for adapter switching).
++
++    The 'default' adapter is a zero-init no-op (identity at load) that exists only
++    so eval can switch the real verbalizer LoRA on/off. peft normally infers
++    target_modules from its built-in model-type->targets map, but newer
++    architectures absent from that map (e.g. gemma4_unified) make an empty
++    LoraConfig() raise "specify target_modules". We therefore name the attention
++    projections explicitly — they exist in every supported decoder, and because
++    the adapter is never trained/applied the exact target set is immaterial.
++    """
+     if not hasattr(model, "peft_config") or "default" not in model.peft_config:
+-        dummy_config = LoraConfig()
++        dummy_config = LoraConfig(target_modules=["q_proj", "v_proj"])
+         model.add_adapter(dummy_config, adapter_name="default")
+ 
+ 
+diff --git a/AObench/open_ended_eval/judge.py b/AObench/open_ended_eval/judge.py
+index a63b593..0630f64 100644
+--- a/AObench/open_ended_eval/judge.py
++++ b/AObench/open_ended_eval/judge.py
+@@ -17,9 +17,12 @@ from typing import Any
+ 
+ import httpx
+ 
+-# Local free Sonnet endpoint (Claude subscription wrapper on Hetzner box)
+-LOCAL_API_BASE = "http://95.216.187.49:8765/v1/chat/completions"
+-LOCAL_API_KEY = "cot-oracle-judge-2026"
++# Local OpenAI-compatible endpoint. Default was a Claude subscription wrapper;
++# point JUDGE_LOCAL_URL at any OpenAI-compatible server (e.g. a local vLLM
++# judge on http://127.0.0.1:8001/v1/chat/completions) with JUDGE_USE_LOCAL=1,
++# JUDGE_USE_ANTHROPIC=0 and JUDGE_MODEL=<served model name>.
++LOCAL_API_BASE = os.environ.get("JUDGE_LOCAL_URL", "http://95.216.187.49:8765/v1/chat/completions")
++LOCAL_API_KEY = os.environ.get("JUDGE_LOCAL_API_KEY", "cot-oracle-judge-2026")
+ 
+ # OpenRouter fallback
+ OPENROUTER_API_BASE = "https://openrouter.ai/api/v1/chat/completions"
+@@ -127,6 +130,7 @@ async def _call_anthropic_native(
+             json={
+                 "model": _anthropic_model(model),
+                 "max_tokens": max_tokens,
++                "temperature": 0.0,  # deterministic grading (reproducible verdicts)
+                 "system": [
+                     {
+                         "type": "text",
+@@ -153,7 +157,11 @@ async def _call_chat_completions(
+     messages: list[dict[str, str]],
+     max_tokens: int,
+     semaphore: asyncio.Semaphore,
++    body_extra: dict[str, Any] | None = None,
+ ) -> dict[str, Any]:
++    body = {"model": model, "max_tokens": max_tokens, "messages": messages}
++    if body_extra:
++        body.update(body_extra)
+     async with semaphore:
+         resp = await client.post(
+             api_base,
+@@ -161,17 +169,19 @@ async def _call_chat_completions(
+                 "Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json",
+             },
+-            json={
+-                "model": model,
+-                "max_tokens": max_tokens,
+-                "messages": messages,
+-            },
++            json=body,
+             timeout=120.0,
+         )
+         resp.raise_for_status()
+ 
+     data = resp.json()
+-    text = data["choices"][0]["message"]["content"]
++    msg = data["choices"][0]["message"]
++    # A vLLM reasoning parser (--reasoning-parser qwen3) can route the whole
++    # reply into `reasoning_content` and leave `content` empty/null — especially
++    # under enable_thinking=false, where the model emits no <think> boundary for
++    # the parser to split on. Fall back to reasoning_content so the JSON the
++    # model actually produced isn't silently dropped as a "no JSON" parse error.
++    text = msg.get("content") or msg.get("reasoning_content")
+     return _extract_json_payload(text)
+ 
+ 
+@@ -181,7 +191,7 @@ async def judge_single(
+     user_message: str,
+     semaphore: asyncio.Semaphore,
+     model: str | None = None,
+-    max_tokens: int = 120,
++    max_tokens: int = 512,
+     max_retries: int = 3,
+ ) -> dict[str, Any]:
+     """Call judge endpoint and parse JSON response.
+@@ -237,14 +247,31 @@ async def judge_single(
+ 
+         if use_local:
+             try:
++                # temperature=0 → deterministic grading: the same (system,user) always
++                # yields the same verdict, so a metric can't move just because the judge
++                # was resampled (the CFE Ottawa case: identical inputs graded both ways).
++                # Disable the served model's <think> phase at the source (vLLM
++                # extension) so judge replies are direct JSON.
++                local_extra: dict[str, Any] = {"temperature": 0.0, "chat_template_kwargs": {
++                    "enable_thinking": os.environ.get("AO_JUDGE_ENABLE_THINKING", "0") == "1"}}
++                msgs = local_messages
++                if attempt > 0:
++                    # Retry escalation: a greedy reply that came back empty or
++                    # non-JSON repeats verbatim on a plain retry, so re-ask with a
++                    # firmer instruction and a little sampling to break the loop.
++                    msgs = [{"role": "user", "content":
++                             f"{system_prompt}\n\n{user_message}\n\n"
++                             "Respond with ONLY a single JSON object — no prose, no markdown fences."}]
++                    local_extra["temperature"] = 0.7
+                 return await _call_chat_completions(
+                     client=client,
+                     api_base=LOCAL_API_BASE,
+                     api_key=LOCAL_API_KEY,
+                     model=model,
+-                    messages=local_messages,
++                    messages=msgs,
+                     max_tokens=max_tokens,
+                     semaphore=semaphore,
++                    body_extra=local_extra,
+                 )
+             except (
+                 httpx.HTTPError,
+@@ -267,6 +294,7 @@ async def judge_single(
+                     messages=openrouter_messages,
+                     max_tokens=max_tokens,
+                     semaphore=semaphore,
++                    body_extra={"temperature": 0.0},  # deterministic grading
+                 )
+             except (
+                 httpx.HTTPError,
+diff --git a/AObench/open_ended_eval/number_prediction.py b/AObench/open_ended_eval/number_prediction.py
+index 72019a6..b79fc3e 100644
+--- a/AObench/open_ended_eval/number_prediction.py
++++ b/AObench/open_ended_eval/number_prediction.py
+@@ -88,7 +88,15 @@ def build_number_prediction_verbalizer_prompt_infos(
+ 
+ 
+ def extract_number_from_response(response: str) -> int | None:
+-    text = response.strip()
++    """Parse the integer the AO predicted the model will output.
++
++    The naive `\\d+` grabs the first digit *run*, so a thousands-separated answer
++    like "192,724,844" truncates to 192 — a parser artifact that wrongly marks a
++    correct prediction as wrong. We first collapse separators that sit *between*
++    digits (commas/underscores), then read the first signed integer, so the full
++    number is recovered before the int-equality comparison.
++    """
++    text = re.sub(r"(?<=\d)[,_](?=\d)", "", response.strip())
+     match = re.search(r"-?\d+", text)
+     if match:
+         return int(match.group())
+diff --git a/AObench/open_ended_eval/run_all.py b/AObench/open_ended_eval/run_all.py
+index 42ce59a..0271a7d 100644
+--- a/AObench/open_ended_eval/run_all.py
++++ b/AObench/open_ended_eval/run_all.py
+@@ -355,6 +355,45 @@ def run_hallucination(
+         max_entries=sample_limit,
+     )
+ 
++
++def run_model_diffing(
++    model, tokenizer, device, output_dir, model_name, verbalizer_lora_paths, n_positions=None, sample_limit=None,
++) -> dict[str, Any]:
++    from AObench.open_ended_eval.model_diffing import run_model_diffing_open_ended_eval
++
++    os.makedirs(output_dir, exist_ok=True)
++    return run_model_diffing_open_ended_eval(
++        model_name=model_name, model=model, tokenizer=tokenizer, device=device,
++        output_dir=output_dir, eval_batch_size=32, verbalizer_lora_paths=verbalizer_lora_paths,
++        max_entries_per_condition=sample_limit,
++    )
++
++
++def run_causal_faithfulness(
++    model, tokenizer, device, output_dir, model_name, verbalizer_lora_paths, n_positions=None, sample_limit=None,
++) -> dict[str, Any]:
++    from AObench.open_ended_eval.causal_faithfulness import run_causal_faithfulness_open_ended_eval
++
++    os.makedirs(output_dir, exist_ok=True)
++    return run_causal_faithfulness_open_ended_eval(
++        model_name=model_name, model=model, tokenizer=tokenizer, device=device,
++        output_dir=output_dir, eval_batch_size=32, verbalizer_lora_paths=verbalizer_lora_paths,
++        max_entries=sample_limit,
++    )
++
++
++def run_abstention(
++    model, tokenizer, device, output_dir, model_name, verbalizer_lora_paths, n_positions=None, sample_limit=None,
++) -> dict[str, Any]:
++    from AObench.open_ended_eval.abstention import run_abstention_open_ended_eval
++
++    os.makedirs(output_dir, exist_ok=True)
++    return run_abstention_open_ended_eval(
++        model_name=model_name, model=model, tokenizer=tokenizer, device=device,
++        output_dir=output_dir, eval_batch_size=32, verbalizer_lora_paths=verbalizer_lora_paths,
++        max_entries=sample_limit,
++    )
++
+ # ---------------------------------------------------------------------------
+ # Eval registry
+ # ---------------------------------------------------------------------------
+@@ -373,6 +412,9 @@ EVALS = [
+     ("domain_confusion", run_domain_confusion),
+     ("activation_sensitivity", run_activation_sensitivity),
+     ("hallucination", run_hallucination),
++    ("model_diffing", run_model_diffing),
++    ("causal_faithfulness", run_causal_faithfulness),
++    ("abstention", run_abstention),
+ ]
+ 
+ DEFAULT_INCLUDE = [name for name, _ in EVALS if name not in {"taboo", "personaqa", "system_prompt_qa_hidden", "system_prompt_qa_latentqa"}]
+@@ -390,6 +432,16 @@ PAPER_SIX_INCLUDE = [
+     "domain_confusion",
+     "missing_info",
+ ]
++# paper_six + the "Not Just Reading Tokens" sensitivity eval (A vs C: identical
++# tokens, different upstream state). It is the cleanest text-inversion-resistance
++# metric and our headline number for the anti-inversion contributions (C1/C3/C4),
++# so we promote it into the default AO recipe profile.
++PAPER_SEVEN_INCLUDE = PAPER_SIX_INCLUDE + ["activation_sensitivity"]
++# paper_seven + the contribution evals (C5 model-diffing, C6 causal-faithfulness).
++# Both SELF-SKIP when their assets are absent (AO_DIFFING_VARIANTS / AO_CFE_DATASET
++# unset), so this profile is safe to run on any checkpoint: it adds the extra
++# metrics only for the runs that built the corresponding data.
++PAPER_SEVEN_PLUS_INCLUDE = PAPER_SEVEN_INCLUDE + ["model_diffing", "causal_faithfulness", "abstention"]
+ PAPER_PLUS_INCLUDE = [
+     "number_prediction",
+     "mmlu_prediction",
+@@ -416,6 +468,8 @@ EVAL_PROFILES = {
+     "default": DEFAULT_INCLUDE,
+     "paper_core": PAPER_CORE_INCLUDE,
+     "paper_six": PAPER_SIX_INCLUDE,
++    "paper_seven": PAPER_SEVEN_INCLUDE,
++    "paper_seven_plus": PAPER_SEVEN_PLUS_INCLUDE,
+     "paper_plus": PAPER_PLUS_INCLUDE,
+     "judge_heavy": JUDGE_HEAVY_INCLUDE,
+     "all": ALL_INCLUDE,
+@@ -565,6 +619,13 @@ if __name__ == "__main__":
+         help="Override number of activation positions for all evals. "
+         "If not set, each eval uses its own default (typically 20).",
+     )
++    parser.add_argument(
++        "--sample-limit",
++        type=int,
++        default=None,
++        help="Cap every eval at this many items (uniform across tasks). For fast "
++        "hyperparameter sweeps; omit for the full benchmark.",
++    )
+     parser.add_argument(
+         "--gpus",
+         type=str,
+@@ -574,12 +635,21 @@ if __name__ == "__main__":
+         "CUDA_VISIBLE_DEVICES is set in the parent, ids are interpreted as "
+         "offsets into that list. Omit for single-GPU sequential execution.",
+     )
++    parser.add_argument(
++        "--model",
++        type=str,
++        default=MODEL_NAME,
++        help=f"Base model the AO LoRA was trained on (default: {MODEL_NAME}). "
++        "Eval datasets under AObench/datasets must match this model.",
++    )
+     args = parser.parse_args()
++    MODEL_NAME = args.model
+ 
+     lora_paths = args.verbalizer_lora or list(STANDARD_VERBALIZER_LORAS)
+     include = args.include if args.include is not None else list(EVAL_PROFILES[args.profile])
+     output_dir = args.output_dir if args.output_dir is not None else OUTPUT_DIR
+     n_positions = args.n_positions
++    sample_limits = {name: args.sample_limit for name in include} if args.sample_limit else None
+     gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()] if args.gpus else None
+ 
+     os.makedirs(output_dir, exist_ok=True)
+@@ -626,6 +696,7 @@ if __name__ == "__main__":
+             verbalizer_lora_paths=lora_paths,
+             include=include,
+             n_positions=n_positions,
++            sample_limits=sample_limits,
+         )
+ 
+     combined_path = os.path.join(output_dir, "all_summaries.json")
+diff --git a/AObench/utils/activation_utils.py b/AObench/utils/activation_utils.py
+index c0202da..57b4954 100644
+--- a/AObench/utils/activation_utils.py
++++ b/AObench/utils/activation_utils.py
+@@ -145,6 +145,29 @@ def get_hf_submodule(model: AutoModelForCausalLM, layer: int, use_lora: bool = F
+     model_name_lower = model_name.lower()
+     is_peft_model = isinstance(model, PeftModel)
+ 
++    # Nested multimodal decoders (Qwen3.5 "qwen3_5"; Gemma 4 "gemma4"): the text
++    # decoder is wrapped inside a multimodal model, and the exact attribute chain
++    # to `.layers` differs by family/transformers-version. Resolve it dynamically
++    # — unwrap PEFT, then walk the known chains until one exposes `.layers`:
++    #   Qwen3.5 -> base.model.language_model.layers (or .language_model / .model)
++    #   Gemma 4 -> base.model.language_model.layers (Gemma4ForConditionalGeneration)
++    #             or base.model.layers (text-only Gemma4ForCausalLM)
++    model_type = getattr(model.config, "model_type", "")
++    if (
++        "qwen3.5" in model_name_lower or model_type == "qwen3_5"
++        or "gemma-4" in model_name_lower or model_type in ("gemma4", "gemma4_text")
++    ):
++        base = model.base_model.model if is_peft_model else model
++        for chain in (("model", "language_model"), ("language_model",), ("model",)):
++            obj = base
++            for attr in chain:
++                obj = getattr(obj, attr, None)
++                if obj is None:
++                    break
++            if obj is not None and hasattr(obj, "layers"):
++                return obj.layers[layer]
++        raise ValueError(f"Could not locate decoder layers for {model_name}")
++
+     if "pythia" in model_name_lower:
+         if use_lora:
+             raise ValueError("Need to determine how to get submodule for LoRA")
+diff --git a/AObench/utils/common.py b/AObench/utils/common.py
+index 09da4ff..bedd430 100644
+--- a/AObench/utils/common.py
++++ b/AObench/utils/common.py
+@@ -24,9 +24,17 @@ def load_model(
+ ) -> AutoModelForCausalLM:
+     print("🧠 Loading model...")
+ 
+-    # Try FA2, fall back to SDPA if not installed
++    # Pick the most memory-efficient attention the model supports.
++    #
++    # gemma4_unified is pinned to SDPA (NOT eager): it declares _supports_sdpa and
++    # applies attention softcapping inside whichever attention interface is
++    # selected, so SDPA is numerically correct here — while the old "eager" pin
++    # materialized the full [seq, seq] fp32 score matrix, an ~19GB buffer on
++    # long-CoT eval tasks that OOM'd the H200 when co-resident with the judge.
++    # (The AO reads residual-stream activations, not attention weights, so it has
++    # no need for eager either.) Other models try FA2, then fall back to SDPA.
+     if "gemma" in model_name.lower():
+-        attn = "eager"
++        attn = "sdpa"
+     else:
+         try:
+             import flash_attn  # noqa: F401
+@@ -42,7 +50,7 @@ def load_model(
+     kwargs: dict = {
+         "device_map": default_device_map,
+         "attn_implementation": attn,
+-        "torch_dtype": dtype,
++        "dtype": dtype,  # transformers>=4.56 name for torch_dtype
+         **model_kwargs,
+     }
+ 
+@@ -50,6 +58,32 @@ def load_model(
+     return model
+ 
+ 
++def _patch_chat_template_returns_list(tokenizer: AutoTokenizer) -> None:
++    """Restore the transformers<5 contract of apply_chat_template(tokenize=True).
++
++    transformers>=5 (required by Qwen3.5) returns a BatchEncoding
++    ({'input_ids', 'attention_mask'}) from apply_chat_template even with
++    return_tensors=None, whereas the eval/dataset code here expects a plain
++    list[int]. We wrap the bound method so that — only when the caller did NOT
++    request a dict or tensors — we transparently unwrap `input_ids`, fixing all
++    call sites at once instead of editing each one.
++    """
++    orig = tokenizer.apply_chat_template
++
++    def wrapped(*args, **kwargs):
++        out = orig(*args, **kwargs)
++        wants_plain = (
++            kwargs.get("tokenize", True)
++            and not kwargs.get("return_dict", False)
++            and kwargs.get("return_tensors") is None
++        )
++        if wants_plain and not isinstance(out, list) and "input_ids" in out:
++            return out["input_ids"]
++        return out
++
++    tokenizer.apply_chat_template = wrapped
++
++
+ def load_tokenizer(
+     model_name: str,
+ ) -> AutoTokenizer:
+@@ -62,6 +96,7 @@ def load_tokenizer(
+         tokenizer.pad_token_id = tokenizer.eos_token_id
+     if not tokenizer.bos_token_id:
+         tokenizer.bos_token_id = tokenizer.eos_token_id
++    _patch_chat_template_returns_list(tokenizer)
+     return tokenizer
+ 
+ 
+@@ -144,9 +179,19 @@ def get_layer_count(model_name: str) -> int:
+ 
+ 
+ def layer_percent_to_layer(model_name: str, layer_percent: int) -> int:
+-    """Convert a layer percent to a layer number."""
++    """Convert a layer percent label back to an absolute layer index.
++
++    MUST be the exact inverse of how the labels are minted in
++    ao_cli.resolve_layers (`round(layer / L * 100)`), and must match the training
++    pipeline's decoder (nl_probes.utils.common.layer_percent_to_layer, which uses
++    `round`). This vendored copy used `int()` (floor), which desynced eval from
++    training: e.g. on Qwen3-8B (36 layers) the label set {58,61,64,67,69} (minted
++    from layers 21-25) floored to [20,21,23,24,24] — wrong layers, and a duplicate
++    that the TrainingDataPoint validator rejects. `round` round-trips exactly for
++    any model with <100 layers.
++    """
+     max_layers = get_layer_count(model_name)
+-    return int(max_layers * (layer_percent / 100))
++    return round(max_layers * (layer_percent / 100))
+ 
+ 
+ def eval_results_root() -> str:
+diff --git a/src/cot_utils.py b/src/cot_utils.py
+index 0a829ab..e492b76 100644
+--- a/src/cot_utils.py
++++ b/src/cot_utils.py
+@@ -11,9 +11,25 @@ import re
+ from functools import lru_cache
+ 
+ 
++# Thinking-delimiter control tokens that must never appear inside CoT text:
++# Qwen's <think> pair and Gemma 4's channel/turn markers. The longer
++# '<|channel>thought' is listed before '<|channel>' so it wins the alternation.
++_THINK_TOKENS_RE = re.compile(
++    r'<think>|</think>|<\|channel>thought|<\|channel>|<channel\|>|<\|turn>|<turn\|>'
++)
++
++
++def strip_think_tokens(text: str) -> str:
++    """Remove Qwen/Gemma thinking-delimiter control tokens from a CoT string."""
++    return _THINK_TOKENS_RE.sub('', text).strip()
++
++
+ def split_cot_into_sentences(cot_text: str) -> list[str]:
+-    """Split CoT text into sentences. Removes <think> tags first."""
+-    text = re.sub(r'<think>|</think>', '', cot_text).strip()
++    """Split CoT text into sentences, first removing thinking-delimiter tokens
++    (Qwen <think> and Gemma 4 <|channel>/<channel|>/<turn|> markers). Truncated
++    Gemma rollouts can leave a dangling '<|channel>thought' opener; this keeps it
++    out of the sentence list."""
++    text = strip_think_tokens(cot_text)
+     sentences = re.split(r'(?<=[.!?])\s+', text)
+     sentences = [s.strip() for s in sentences if s.strip()]
+     return sentences
+diff --git a/src/data_pipeline/generate_cots.py b/src/data_pipeline/generate_cots.py
+index 2ca84ed..43b5447 100644
+--- a/src/data_pipeline/generate_cots.py
++++ b/src/data_pipeline/generate_cots.py
+@@ -22,6 +22,7 @@ Usage:
+ import argparse
+ import asyncio
+ import json
++import os
+ import re
+ import sys
+ from pathlib import Path
+@@ -669,21 +670,43 @@ def load_all_problems(
+ # ============================================================
+ 
+ def extract_answer(response: str) -> str | None:
+-    """Extract final answer from model response."""
++    """Extract the final answer from a model response.
++
++    Two response shapes occur and both must be handled:
++      (1) VERBOSE — the answer is embedded in prose (`\\boxed{}`, `#### 42`,
++          "the answer is C", a trailing number). This is the classic CoT shape.
++      (2) TERSE — the response IS the answer, because the thinking has already
++          been split off into a separate channel. Thinking models (Gemma's
++          `<channel|>` thought channel, Qwen's `</think>`) emit a bare token
++          here: "C", "RIGHT", "**A**", "farmyard". The original prose-only
++          patterns returned None on these, silently scoring every correct
++          terse answer as wrong.
++
++    Strategy: try the verbose patterns first (most specific), then fall back to
++    treating a SHORT single-line remainder as the literal answer. Markdown
++    emphasis is stripped throughout so "**A**" reads as "A".
++    """
+     if not response:
+         return None
+-    boxed = re.findall(r'\\boxed\{([^}]+)\}', response)
++    text = response.strip()
++    # Drop surrounding markdown/quoting so '**A**' / '`C`' -> 'A' / 'C'.
++    stripped = re.sub(r'^[\*`_"\'\s]+|[\*`_"\'\s]+$', '', text)
++    boxed = re.findall(r'\\boxed\{([^}]+)\}', text)
+     if boxed:
+         return boxed[-1].strip()
+-    hashes = re.findall(r'####\s*(.+?)(?:\n|$)', response)
++    hashes = re.findall(r'####\s*(.+?)(?:\n|$)', text)
+     if hashes:
+         return hashes[-1].strip().replace(",", "")
+-    # Letter answers (for MCQ)
+-    letter_match = re.findall(r'(?:answer|option)\s+(?:is\s+)?([A-E])\b', response, re.IGNORECASE)
++    # Whole response is a bare MCQ letter: 'C', 'C.', '(C)', 'C)'.
++    bare_letter = re.match(r'^\(?([A-E])\)?[.):]?$', stripped)
++    if bare_letter:
++        return bare_letter.group(1).upper()
++    # Letter answers embedded in prose ('the answer is C', 'option (C)').
++    letter_match = re.findall(r'(?:answer|option)\s+(?:is\s+)?\(?([A-E])\)?\b', text, re.IGNORECASE)
+     if letter_match:
+         return letter_match[-1].upper()
+     # "The answer is X" pattern
+-    answer_is = re.findall(r'(?:the\s+)?answer\s+is\s*:?\s*(.+?)(?:\.|$)', response, re.IGNORECASE)
++    answer_is = re.findall(r'(?:the\s+)?answer\s+is\s*:?\s*(.+?)(?:\.|$)', text, re.IGNORECASE)
+     if answer_is:
+         ans = answer_is[-1].strip()
+         if len(ans) <= 50:
+@@ -694,21 +717,35 @@ def extract_answer(response: str) -> str | None:
+         r'\*\*(-?\d+(?:[.,]\d+)*)\*\*\s*$',
+     ]
+     for pattern in answer_patterns:
+-        matches = re.findall(pattern, response, re.IGNORECASE | re.MULTILINE)
++        matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+         if matches:
+             return matches[-1].strip().replace(",", "")
+-    numbers = re.findall(r'(-?\d+(?:\.\d+)?)', response)
++    # Terse answer already isolated by the thinking split: a short single-line
++    # remainder IS the answer (e.g. 'RIGHT', 'farmyard'). Guard on length/newline
++    # so we never swallow a verbose paragraph here.
++    if stripped and len(stripped) <= 40 and "\n" not in stripped:
++        return stripped
++    numbers = re.findall(r'(-?\d+(?:\.\d+)?)', text)
+     if numbers:
+         return numbers[-1]
+     return None
+ 
+ 
+ def answers_match(model_answer: str | None, correct_answer: str) -> bool:
+-    """Check if model answer matches correct answer (fuzzy numeric comparison)."""
++    """Check if a model answer matches the gold answer (fuzzy, format-robust).
++
++    Normalizes away the cosmetic differences that otherwise cause false
++    mismatches on terse thinking-model answers: markdown emphasis (`**A**`),
++    enclosing brackets/quotes, trailing punctuation, commas/spaces, a `.0`
++    suffix, and `\\frac{a}{b}`. Comparison is case-insensitive.
++    """
+     if model_answer is None:
+         return False
+     def normalize(s: str) -> str:
+-        s = s.strip().replace(",", "").replace(" ", "")
++        s = str(s).strip()
++        # Strip surrounding markdown/brackets/quotes and trailing punctuation.
++        s = re.sub(r'^[\*`_"\'\(\[\s]+|[\*`_"\'\)\].:\s]+$', '', s)
++        s = s.replace(",", "").replace(" ", "")
+         if s.endswith(".0"):
+             s = s[:-2]
+         frac = re.match(r'\\frac\{(\d+)\}\{(\d+)\}', s)
+@@ -1165,8 +1202,6 @@ def _is_blackwell_gpu() -> bool:
+ 
+ def _should_enforce_vllm_eager(args) -> bool:
+     """Decide whether to set vLLM enforce_eager=True."""
+-    import os
+-
+     if getattr(args, "vllm_enforce_eager", False):
+         return True
+     if getattr(args, "no_vllm_eager_auto", False):
+@@ -1248,7 +1283,6 @@ def main():
+     problems = load_all_problems(sources, split, args.levels)
+ 
+     if args.openrouter:
+-        import os
+         api_key = args.openrouter_key or os.environ.get("OPENROUTER_API_KEY")
+         if not api_key:
+             raise ValueError("Set OPENROUTER_API_KEY env var or pass --openrouter-key")
+@@ -1364,7 +1398,7 @@ def main():
+                     model=args.model,
+                     dtype="bfloat16",
+                     tensor_parallel_size=1,
+-                    max_model_len=8192,
++                    max_model_len=16384,  # room for prompt + the 8192-token CoT cap (Qwen3.5-4B is verbose)
+                     gpu_memory_utilization=0.95,
+                     enable_prefix_caching=True,
+                 )
+@@ -1385,7 +1419,14 @@ def main():
+                 from vllm import SamplingParams as _SP
+                 _test = llm.generate(["test"], _SP(max_tokens=1))
+                 del _test
+-                cot_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=4096)
++                # max_tokens=8192 gives reasoning room for verbose models without
++                # truncating mid-thought (an empty answer otherwise). Gemma 4 is
++                # markedly more token-efficient than Qwen3.5-4B, so this is ample.
++                # skip_special_tokens=False is REQUIRED so the thinking delimiters
++                # survive detokenization for parse_think (Gemma's <|channel>thought
++                # / <channel|> and Qwen's </think> are special tokens).
++                cot_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=8192,
++                                            skip_special_tokens=False)
+                 direct_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=200)
+                 print("vLLM loaded and verified.")
+             except Exception as e:
+@@ -1407,24 +1448,10 @@ def main():
+             direct_params = {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 200}
+             print("SGLang loaded successfully.")
+ 
+-        # Format all prompts
+-        print("Formatting prompts...")
+-        cot_prompts = []
+-        direct_prompts = []
+-        direct_indices = []
+-        for i, p in enumerate(problems):
+-            msgs = [{"role": "user", "content": p["question"]}]
+-            cot_prompts.append(tokenizer.apply_chat_template(
+-                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+-            ))
+-            if p["source"] not in NO_GROUND_TRUTH_SOURCES:
+-                direct_prompts.append(tokenizer.apply_chat_template(
+-                    msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+-                ))
+-                direct_indices.append(i)
+-
+         def run_generate(prompts, params):
+-            """Run generation with either vLLM or SGLang."""
++            """Run generation with either vLLM or SGLang (empty list -> no call)."""
++            if not prompts:
++                return []
+             if use_sglang:
+                 outputs = llm.generate(prompts, sampling_params=params)
+                 return [o["text"] for o in outputs]
+@@ -1435,73 +1462,145 @@ def main():
+         def count_tokens(texts):
+             return sum(len(tokenizer.encode(t, add_special_tokens=False)) for t in texts)
+ 
++        def parse_think(text):
++            """Split a thinking rollout into (reasoning, content), model-agnostic.
++
++            Two target-model thinking formats are supported:
++              Gemma 4 : "<|channel>thought ...reasoning... <channel|> ...answer..."
++                        (the reasoning lives in the 'thought' channel; the answer
++                        follows the <channel|> closer, up to the <turn|> turn end)
++              Qwen    : "<think> ...reasoning... </think> ...answer..."
++            Both delimiters are SPECIAL tokens, so generation must keep them
++            (SamplingParams skip_special_tokens=False below). Falls back to
++            (text, "") when no thinking markers are present (e.g. direct answers).
++            """
++            if "<channel|>" in text:  # Gemma 4 thought channel
++                think_part, _, answer = text.partition("<channel|>")
++                think_part = think_part.split("<|channel>thought", 1)[-1].replace("<|channel>", "")
++                answer = answer.split("<turn|>", 1)[0]
++                return think_part.strip(), answer.strip()
++            if "</think>" in text:  # Qwen
++                parts = text.split("</think>", 1)
++                return parts[0].lstrip("<think>").strip(), (parts[1].strip() if len(parts) > 1 else "")
++            # No closer found — generation was truncated mid-thought (hit the
++            # token cap before emitting <channel|> / </think>). Drop any dangling
++            # opener so the leftover special token doesn't leak into the CoT text.
++            cleaned = text.replace("<|channel>thought", "").replace("<|channel>", "")
++            return cleaned.strip(), ""
++
++        # --- Durable, resumable generation -----------------------------------
++        # Mechanism: process the (deterministically ordered) problems in chunks.
++        # After each chunk we append its corpus entries, fsync, and record a
++        # sidecar "<output>.progress" = "<problems_done> <byte_offset>". A killed
++        # run (e.g. SIGHUP when an ssh/terminal session closes overnight) thus
++        # loses at most one chunk. Re-running resumes: we truncate the output back
++        # to the last fsynced byte offset (dropping any partial tail) and continue
++        # from the recorded problem count. Single big generate() calls write
++        # nothing until the very end, which is what previously lost a whole run.
+         n_rollouts = args.n_rollouts
+-        all_cot_rollouts: list[list[dict]] = []
+-
+-        for rollout_idx in range(n_rollouts):
+-            print(f"\n{'=' * 60}")
+-            print(f"CoT rollout {rollout_idx + 1}/{n_rollouts}: {len(cot_prompts)} prompts")
+-            print(f"{'=' * 60}")
+-            t0 = time.time()
+-            raw_texts = run_generate(cot_prompts, cot_params)
+-            elapsed = time.time() - t0
+-            total_toks = count_tokens(raw_texts)
+-            print(f"  Done in {elapsed:.1f}s — {total_toks:,} tokens — {total_toks/elapsed:.0f} tok/s")
+-
+-            # Parse <think>...</think> to split reasoning from content
+-            rollout_results = []
+-            for text in raw_texts:
+-                if "</think>" in text:
+-                    parts = text.split("</think>", 1)
+-                    reasoning = parts[0].lstrip("<think>").strip()
+-                    content = parts[1].strip() if len(parts) > 1 else ""
+-                else:
+-                    reasoning = text.strip()
+-                    content = ""
+-                rollout_results.append({"reasoning": reasoning, "content": content})
+-            all_cot_rollouts.append(rollout_results)
+-
+-        # Direct responses
+-        print(f"\nDirect responses: {len(direct_prompts)} prompts (skipping {len(problems) - len(direct_prompts)} no-ground-truth)...")
+-        t0 = time.time()
+-        raw_direct = run_generate(direct_prompts, direct_params)
+-        elapsed = time.time() - t0
+-        total_toks = count_tokens(raw_direct)
+-        print(f"  Done in {elapsed:.1f}s — {total_toks:,} tokens — {total_toks/elapsed:.0f} tok/s")
+-
+-        empty_response = {"reasoning": "", "content": ""}
+-        direct_responses_map: dict[int, dict] = {}
+-        for j, idx in enumerate(direct_indices):
+-            direct_responses_map[idx] = {"reasoning": "", "content": raw_direct[j].strip()}
+-        direct_responses = [direct_responses_map.get(i, empty_response) for i in range(len(problems))]
+-
+-        # Process results
+-        print("\nProcessing results...")
+-        results = process_results_openrouter(
+-            problems, all_cot_rollouts, direct_responses, tokenizer=tokenizer,
+-        )
++        CHUNK_SIZE = 1000  # >> vLLM concurrency, so per-chunk batching keeps throughput high
++        progress_path = str(output_path) + ".progress"
++
++        # Sidecar = "<problems_done> <byte_offset> <total_problems>". The total
++        # guards against silently resuming onto a different problem set (e.g. after
++        # n_problems changed): only resume when it matches this run's problem count.
++        start_idx, resume_offset = 0, None
++        if os.path.exists(progress_path) and os.path.exists(output_path):
++            try:
++                done_str, off_str, total_str = Path(progress_path).read_text().split()
++                if int(total_str) == len(problems):
++                    start_idx, resume_offset = int(done_str), int(off_str)
++            except (ValueError, IndexError):
++                start_idx, resume_offset = 0, None
++        start_idx = max(0, min(start_idx, len(problems)))
++
++        if start_idx > 0 and resume_offset is not None:
++            os.truncate(output_path, resume_offset)  # drop any partial chunk from a crash
++            f = open(output_path, "a")
++            print(f"Resuming: {start_idx}/{len(problems)} problems already done "
++                  f"(output truncated to {resume_offset} bytes).")
++        else:
++            start_idx = 0
++            f = open(output_path, "w")
+ 
+-        # Save with stats
+         stats: dict[str, int] = {}
+         source_counts: dict[str, int] = {}
+         saved = 0
+-        with open(output_path, "w") as f:
+-            for r in results:
+-                cat = r["category"] or "no_ground_truth"
+-                stats[cat] = stats.get(cat, 0) + 1
+-                source_counts[r["source"]] = source_counts.get(r["source"], 0) + 1
+-                f.write(json.dumps(r) + "\n")
+-                saved += 1
++        total_cot_chars = 0
++
++        try:
++            for chunk_start in range(start_idx, len(problems), CHUNK_SIZE):
++                chunk_end = min(chunk_start + CHUNK_SIZE, len(problems))
++                chunk = problems[chunk_start:chunk_end]
++                print(f"\n{'=' * 60}")
++                print(f"Chunk {chunk_start}-{chunk_end} / {len(problems)} problems")
++                print(f"{'=' * 60}")
++
++                # Build this chunk's prompts: CoT (thinking) for every problem;
++                # a direct (no-thinking) answer only for ground-truth sources,
++                # tracked by local position within the chunk.
++                cot_prompts, direct_prompts, direct_local_indices = [], [], []
++                for local_i, p in enumerate(chunk):
++                    msgs = [{"role": "user", "content": p["question"]}]
++                    cot_prompts.append(tokenizer.apply_chat_template(
++                        msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True,
++                    ))
++                    if p["source"] not in NO_GROUND_TRUTH_SOURCES:
++                        direct_prompts.append(tokenizer.apply_chat_template(
++                            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
++                        ))
++                        direct_local_indices.append(local_i)
++
++                all_cot_rollouts: list[list[dict]] = []
++                for rollout_idx in range(n_rollouts):
++                    t0 = time.time()
++                    raw_texts = run_generate(cot_prompts, cot_params)
++                    elapsed = time.time() - t0
++                    toks = count_tokens(raw_texts)
++                    print(f"  CoT rollout {rollout_idx + 1}/{n_rollouts}: {toks:,} tok in "
++                          f"{elapsed:.1f}s ({toks / max(elapsed, 1e-9):.0f} tok/s)")
++                    all_cot_rollouts.append(
++                        [dict(zip(("reasoning", "content"), parse_think(t))) for t in raw_texts]
++                    )
++
++                raw_direct = run_generate(direct_prompts, direct_params)
++                empty_response = {"reasoning": "", "content": ""}
++                direct_map = {
++                    direct_local_indices[j]: {"reasoning": "", "content": raw_direct[j].strip()}
++                    for j in range(len(direct_local_indices))
++                }
++                direct_responses = [direct_map.get(i, empty_response) for i in range(len(chunk))]
++
++                results = process_results_openrouter(
++                    chunk, all_cot_rollouts, direct_responses, tokenizer=tokenizer,
++                )
++                for r in results:
++                    cat = r["category"] or "no_ground_truth"
++                    stats[cat] = stats.get(cat, 0) + 1
++                    source_counts[r["source"]] = source_counts.get(r["source"], 0) + 1
++                    total_cot_chars += len(r.get("cot_response", ""))
++                    f.write(json.dumps(r) + "\n")
++                    saved += 1
+ 
+-        total_cot_chars = sum(len(r.get("cot_response", "")) for r in results)
++                # Make the chunk durable, then advance the resume watermark
++                # (write-then-rename = atomic) so the two can't disagree.
++                f.flush()
++                os.fsync(f.fileno())
++                byte_offset = f.tell()
++                tmp = progress_path + ".tmp"
++                Path(tmp).write_text(f"{chunk_end} {byte_offset} {len(problems)}")
++                os.replace(tmp, progress_path)
++                print(f"  saved {saved} new entries; progress {chunk_end}/{len(problems)}")
++        finally:
++            f.close()
+ 
+         print(f"\n{'=' * 60}")
+-        print(f"FINAL STATS")
++        print(f"FINAL STATS (this run)")
+         print(f"{'=' * 60}")
+-        print(f"  Problems loaded: {len(problems)}")
++        print(f"  Problems processed: {len(problems) - start_idx} (resumed from {start_idx})")
+         print(f"  Rollouts per problem: {n_rollouts}")
+-        print(f"  Total entries saved: {saved}")
+-        print(f"  Est. CoT tokens: {total_cot_chars // 4:,}")
++        print(f"  Entries saved this run: {saved}")
++        print(f"  Est. CoT tokens this run: {total_cot_chars // 4:,}")
+         print(f"\n  By category:")
+         for k, v in sorted(stats.items()):
+             pct = v / saved * 100 if saved > 0 else 0
+@@ -1509,7 +1608,7 @@ def main():
+         print(f"\n  By source:")
+         for k, v in sorted(source_counts.items(), key=lambda x: -x[1]):
+             print(f"    {k}: {v}")
+-        print(f"\n  Output: {output_path}")
++        print(f"  Output: {output_path}")
+ 
+ 
+ if __name__ == "__main__":
